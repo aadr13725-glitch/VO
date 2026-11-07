@@ -27,9 +27,9 @@ except ImportError:
     yt_dlp = None
 
 # ================== الإعدادات ==================
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TOKEN = os.getenv("BOT_TOKEN", "6493030755:AAFA-RSEiu-trjdRZf40I39V6eiUzd4l0rk").strip()
 try:
-    OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or "0")
+    OWNER_ID = int(os.getenv("OWNER_ID", "826293470").strip() or "826293470")
 except ValueError:
     raise SystemExit("❌ يجب أن يكون OWNER_ID رقماً صحيحاً.")
 if OWNER_ID < 0:
