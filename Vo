@@ -1,0 +1,1583 @@
+# -*- coding: utf-8 -*-
+"""
+Social Video Downloader Bot  (python-telegram-bot >= 21  +  yt-dlp)
+
+التشغيل:
+    pip install -U "python-telegram-bot>=21" yt-dlp
+    export BOT_TOKEN="التوكن"
+    export OWNER_ID="معرّف_حسابك"
+    export ADMIN_IDS="معرّف1,معرّف2"  # اختياري
+    python video_bot.py
+"""
+import os, re, sys, html, shutil, sqlite3, asyncio, logging, secrets, tempfile, time, subprocess
+import ipaddress, socket
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlparse
+
+from telegram import (Update, InlineKeyboardButton as IB, InlineKeyboardMarkup as IM,
+                      BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeChat, ReplyParameters)
+from telegram.constants import ParseMode, ChatAction
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.ext import (Application, CommandHandler, MessageHandler,
+                          CallbackQueryHandler, ChatMemberHandler, ContextTypes, filters)
+
+try:
+    import yt_dlp
+except ImportError:
+    yt_dlp = None
+
+# ================== الإعدادات ==================
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "0").strip() or "0")
+except ValueError:
+    raise SystemExit("❌ يجب أن يكون OWNER_ID رقماً صحيحاً.")
+if OWNER_ID < 0:
+    raise SystemExit("❌ يجب أن يكون OWNER_ID موجباً أو صفراً.")
+ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+if OWNER_ID > 0:
+    ADMINS.add(OWNER_ID)
+DEFAULT_CHANNEL = os.getenv("CHANNEL", "@HibaAll22")      # يُضاف أول مرة فقط، ويمكن تعديل القنوات من لوحة المشرف
+DB_FILE = os.getenv("DB_FILE", "video_bot.db")
+COOKIES = os.getenv("COOKIES_FILE", "cookies.txt")
+try:
+    MAX_MB = max(1, min(49, int(os.getenv("MAX_MB", "49"))))  # حد رفع البوتات في تيليغرام ~50MB
+    MAX_PARALLEL = max(1, min(8, int(os.getenv("MAX_PARALLEL", "2"))))
+except ValueError:
+    raise SystemExit("❌ MAX_MB و MAX_PARALLEL يجب أن يكونا رقمين صحيحين.")
+# ===============================================
+
+MAX_CH = 10                                               # أقصى عدد قنوات اشتراك إجباري
+
+if not TOKEN:
+    raise SystemExit("❌ ضع التوكن في متغير البيئة BOT_TOKEN قبل التشغيل.")
+if yt_dlp is None:
+    raise SystemExit("❌ مكتبة yt-dlp غير مثبتة. أضفها إلى requirements.txt")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("videobot")
+for _n in ("httpx", "httpcore", "telegram"):
+    logging.getLogger(_n).setLevel(logging.WARNING)   # لا تطبع التوكن في السجل
+esc = html.escape
+HTML = ParseMode.HTML
+LIMIT_BYTES = MAX_MB * 1024 * 1024
+try:
+    DEFAULT_LIMIT = str(max(0, int(os.getenv("DAILY_LIMIT", "20"))))
+except ValueError:
+    DEFAULT_LIMIT = "20"
+HAS_FFMPEG = shutil.which("ffmpeg") is not None
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+
+# ---------------- قاعدة البيانات ----------------
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.executescript("""
+CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY, name TEXT, lang TEXT DEFAULT 'ar',
+    banned INTEGER DEFAULT 0, joined TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS channels(name TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS admins(
+    id INTEGER PRIMARY KEY, added_by INTEGER, added_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS dl_log(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, platform TEXT, url TEXT,
+    ok INTEGER, size INTEGER, err TEXT, ts TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_log_uid ON dl_log(uid, ts);
+CREATE TABLE IF NOT EXISTS activity(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, ms INTEGER, ts TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_act_ts ON activity(ts);
+""")
+if "blocked" not in [r["name"] for r in db.execute("PRAGMA table_info(users)")]:
+    db.execute("ALTER TABLE users ADD COLUMN blocked INTEGER DEFAULT 0")   # من حظر البوت
+if "enabled" not in [r["name"] for r in db.execute("PRAGMA table_info(channels)")]:
+    db.execute("ALTER TABLE channels ADD COLUMN enabled INTEGER DEFAULT 1")
+if not db.execute("SELECT 1 FROM channels").fetchone() and DEFAULT_CHANNEL:
+    db.execute("INSERT OR IGNORE INTO channels(name) VALUES(?)", (DEFAULT_CHANNEL,))
+db.commit()
+
+
+def rows(sql, a=()): return db.execute(sql, a).fetchall()
+def one(sql, a=()): return db.execute(sql, a).fetchone()
+
+
+def run(sql, a=()):
+    cur = db.execute(sql, a)
+    db.commit()
+    return cur.lastrowid
+
+
+def S(key, default=""):
+    r = one("SELECT value FROM settings WHERE key=?", (key,))
+    return r["value"] if r else default
+
+
+def set_S(key, value):
+    run("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def flag(key, default="0"): return S(key, default) == "1"
+def admin_ids():
+    return set(ADMINS) | {r["id"] for r in rows("SELECT id FROM admins")}
+
+
+def is_admin(uid): return uid in admin_ids()
+def is_owner(uid): return OWNER_ID > 0 and uid == OWNER_ID
+
+
+def daily_limit():
+    try:
+        return max(0, int(S("daily_limit", DEFAULT_LIMIT) or 0))
+    except (TypeError, ValueError):
+        return max(0, int(DEFAULT_LIMIT))
+
+
+def safe_url_label(url):
+    """احتفظ باسم المضيف فقط في السجلات لتجنب تخزين معاملات وروابط خاصة."""
+    try:
+        return (urlparse(url).hostname or "unknown")[:200]
+    except Exception:
+        return "unknown"
+
+
+def safe_error_text(value):
+    """أزل معاملات الروابط من رسائل الأخطاء قبل حفظها أو تسجيلها."""
+    return re.sub(r"https?://[^\s<>\"']+", lambda m: safe_url_label(m.group(0)),
+                  str(value or ""))[:300]
+
+
+def validate_public_url(url):
+    """ارفض المخططات غير المدعومة وعناوين الشبكة المحلية قبل تمرير الرابط إلى yt-dlp."""
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("only public HTTP(S) URLs are supported")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing credentials are not supported")
+    host = parsed.hostname.rstrip(".").lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise ValueError("local hosts are not supported")
+    try:
+        addresses = {ipaddress.ip_address(host)}
+    except ValueError:
+        try:
+            addresses = {
+                ipaddress.ip_address(result[4][0].split("%", 1)[0])
+                for result in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                                 type=socket.SOCK_STREAM)
+            }
+        except (OSError, ValueError):
+            raise ValueError("could not resolve a public host")
+    if not addresses or any(not address.is_global for address in addresses):
+        raise ValueError("private or reserved hosts are not supported")
+
+
+def channel_list(only_enabled=False):
+    sql = "SELECT name FROM channels" + (" WHERE enabled=1" if only_enabled else "") + " ORDER BY rowid"
+    return [r["name"] for r in rows(sql)]
+
+
+def is_banned(uid):
+    u = one("SELECT banned FROM users WHERE id=?", (uid,))
+    return bool(u and u["banned"])
+
+
+def get_lang(uid):
+    u = one("SELECT lang FROM users WHERE id=?", (uid,))
+    return u["lang"] if u and u["lang"] in ("ar", "en") else "ar"
+
+
+def register_user(user):
+    is_new = one("SELECT 1 FROM users WHERE id=?", (user.id,)) is None
+    if is_new:
+        run("INSERT INTO users(id,name) VALUES(?,?)", (user.id, user.full_name))
+    else:
+        run("UPDATE users SET name=?, blocked=0 WHERE id=?", (user.full_name, user.id))
+    return is_new
+
+
+def today_count(uid):
+    return one("SELECT COUNT(*) c FROM dl_log WHERE uid=? AND ok=1 AND date(ts)=date('now')", (uid,))["c"]
+
+
+# ---------------- النصوص (عربي / إنجليزي) ----------------
+T = {
+    "ar": {
+        "welcome": "👋 أهلاً <b>{name}</b>!\n\n📥 أرسل لي أي رابط فيديو وسأحمله لك فوراً <b>بدون علامة مائية</b>.\n\n"
+                   "📖 <b>داخل المجموعات:</b>\n<code>/d</code> رابط ← تحميل فيديو\n<code>/a</code> رابط ← صوت فقط\n"
+                   "أو رد على رسالة فيها رابط بـ <code>/d</code>\n\n👇 اختر المنصة لمعرفة الطريقة:",
+        "tip": "📎 أرسل رابط فيديو من <b>{p}</b> وسأحمله لك مباشرة.",
+        "tip_any": "🌐 أرسل رابط أي موقع يحتوي على فيديو، وسأحاول تحميله لك.",
+        "sub_needed": "🔒 يجب الاشتراك في القنوات التالية أولاً لاستخدام البوت، ثم اضغط «تحققت».",
+        "downloading": "⏳ جاري التحميل...", "uploading": "📤 جاري الرفع...",
+        "err_private": "🔐 هذا المحتوى خاص أو يتطلب تسجيل دخول.",
+        "err_generic": "⚠️ تعذّر التحميل. تأكد أن الرابط عام وصحيح وحاول لاحقاً.",
+        "err_toobig": "📦 الملف أكبر من حد تيليغرام ({mb}MB) ولا توجد جودة أقل مناسبة.",
+        "err_limit": "⛔ وصلت للحد اليومي ({n} تحميلات). عُد غداً 🌙",
+        "busy": "⏳ لديك تحميل قيد التنفيذ، انتظر انتهاءه.",
+        "banned": "🚫 أنت محظور من استخدام البوت.",
+        "maint": "🛠 البوت قيد الصيانة حالياً، حاول لاحقاً.",
+        "no_link": "📎 أرسل رابطاً صحيحاً (يبدأ بـ http).",
+        "err_url": "⚠️ الرابط غير صالح أو يشير إلى عنوان خاص غير مسموح.",
+        "usage_cmd": "الاستخدام: <code>/d رابط</code> أو رد على رسالة فيها رابط بـ <code>/d</code>",
+        "stats_me": "📊 <b>إحصائياتي</b>\n\n📥 إجمالي التحميلات: {total}\n📅 اليوم: {today}/{limit}\n📆 انضممت: {joined}",
+        "choose_lang": "🌍 اختر اللغة:", "lang_set": "✅ تم تغيير اللغة",
+        "report_prompt": "🆘 اكتب مشكلتك (نص أو لقطة شاشة) وسأوصلها للإدارة.\n\n/cancel للإلغاء",
+        "report_sent": "✅ وصلت رسالتك للإدارة، سيتم الرد عليك.",
+        "cancelled": "تم الإلغاء ✅", "from_admin": "📩 <b>الإدارة:</b>",
+        "caption": "✅ تم التحميل", "not_yet": "❌ لم تشترك بعد في كل القنوات",
+        "b_audio": "🎵 صوت فقط", "b_back": "🔙 رجوع", "b_chk": "✅ تحققت من الاشتراك", "b_join": "📢 اشترك في",
+        "b_any": "🌐 أي موقع", "b_stats": "📊 إحصائياتي", "b_report": "🆘 إبلاغ عن مشكلة",
+        "b_help": "📖 طريقة الاستخدام",
+        "help": ("📖 <b>طريقة استخدام البوت</b>\n\n"
+                 "1️⃣ أرسل رابط فيديو عام وسأبدأ التحميل مباشرة.\n"
+                 "2️⃣ اضغط «🎵 صوت فقط» أسفل الفيديو لتحميل صوته.\n"
+                 "3️⃣ داخل المجموعات: استخدم <code>/d رابط</code> للفيديو أو <code>/a رابط</code> للصوت، "
+                 "أو ردّ على رسالة الرابط بأحد الأمرين.\n"
+                 "4️⃣ إذا واجهت مشكلة، استخدم «🆘 إبلاغ عن مشكلة» من القائمة.\n\n"
+                 "⚠️ الروابط الخاصة أو التي تتطلب تسجيل دخول قد لا تعمل."),
+        "b_lang": "🌍 تغيير اللغة", "b_group": "➕ أضف البوت لمجموعتك",
+        "plat_off": "🚫 التحميل من {p} معطّل حالياً.",
+        "plat": {"youtube": "اليوتيوب", "facebook": "الفيسبوك", "instagram": "الانستكرام", "tiktok": "التيك توك",
+                 "likee": "لايكي", "twitter": "تويتر", "snapchat": "سناب جات", "pinterest": "بنترست",
+                 "soundcloud": "ساوند كلاود", "threads": "ثريدز"},
+    },
+    "en": {
+        "welcome": "👋 Hi <b>{name}</b>!\n\n📥 Send me any video link and I'll download it for you instantly, <b>no watermark</b>.\n\n"
+                   "📖 <b>In groups:</b>\n<code>/d</code> link → download video\n<code>/a</code> link → audio only\n"
+                   "or reply to a message containing a link with <code>/d</code>\n\n👇 Pick a platform to see how:",
+        "tip": "📎 Send me a video link from <b>{p}</b> and I'll download it.",
+        "tip_any": "🌐 Send a link from any site that has a video and I'll try to download it.",
+        "sub_needed": "🔒 Please join the channels below first, then press “Verify”.",
+        "downloading": "⏳ Downloading...", "uploading": "📤 Uploading...",
+        "err_private": "🔐 This content is private or requires login.",
+        "err_generic": "⚠️ Download failed. Make sure the link is public and valid, then try again later.",
+        "err_toobig": "📦 The file exceeds Telegram's limit ({mb}MB) and no smaller quality is available.",
+        "err_limit": "⛔ You reached the daily limit ({n} downloads). Come back tomorrow 🌙",
+        "busy": "⏳ You already have a download running, please wait.",
+        "banned": "🚫 You are banned from using this bot.",
+        "maint": "🛠 The bot is under maintenance, try again later.",
+        "no_link": "📎 Please send a valid link (starting with http).",
+        "err_url": "⚠️ This URL is invalid or points to a restricted private address.",
+        "usage_cmd": "Usage: <code>/d link</code> or reply to a message containing a link with <code>/d</code>",
+        "stats_me": "📊 <b>My stats</b>\n\n📥 Total downloads: {total}\n📅 Today: {today}/{limit}\n📆 Joined: {joined}",
+        "choose_lang": "🌍 Choose language:", "lang_set": "✅ Language changed",
+        "report_prompt": "🆘 Describe your problem (text or screenshot) and I'll forward it to the admins.\n\n/cancel to abort",
+        "report_sent": "✅ Your message was sent to the admins.",
+        "cancelled": "Cancelled ✅", "from_admin": "📩 <b>Admin:</b>",
+        "caption": "✅ Downloaded", "not_yet": "❌ You haven't joined all channels yet",
+        "b_audio": "🎵 Audio only", "b_back": "🔙 Back", "b_chk": "✅ Verify subscription", "b_join": "📢 Join",
+        "b_any": "🌐 Any website", "b_stats": "📊 My stats", "b_report": "🆘 Report a problem",
+        "b_help": "📖 How to use",
+        "help": ("📖 <b>How to use the bot</b>\n\n"
+                 "1️⃣ Send a public video link to start downloading.\n"
+                 "2️⃣ Press “🎵 Audio only” below a video to get its audio.\n"
+                 "3️⃣ In groups: use <code>/d link</code> for video or <code>/a link</code> for audio, "
+                 "or reply to a link message with either command.\n"
+                 "4️⃣ If something goes wrong, use “🆘 Report a problem” in the menu.\n\n"
+                 "⚠️ Private links and content requiring login may not work."),
+        "b_lang": "🌍 Language", "b_group": "➕ Add bot to your group",
+        "plat_off": "🚫 Downloads from {p} are currently disabled.",
+        "plat": {"youtube": "YouTube", "facebook": "Facebook", "instagram": "Instagram", "tiktok": "TikTok",
+                 "likee": "Likee", "twitter": "Twitter / X", "snapchat": "Snapchat", "pinterest": "Pinterest",
+                 "soundcloud": "SoundCloud", "threads": "Threads"},
+    },
+}
+
+
+def tr(uid, key, **kw):
+    lang = get_lang(uid)
+    s = T[lang].get(key)
+    if s is None: s = T["ar"][key]
+    return s.format(**kw) if kw else s
+
+
+PLATS = {
+    "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com"),
+    "facebook": ("facebook.com", "fb.watch", "fb.com"),
+    "instagram": ("instagram.com",),
+    "tiktok": ("tiktok.com",),
+    "likee": ("likee.video", "likee.com"),
+    "twitter": ("twitter.com", "x.com", "t.co"),
+    "snapchat": ("snapchat.com",),
+    "pinterest": ("pinterest.com", "pin.it"),
+    "soundcloud": ("soundcloud.com", "snd.sc"),
+    "threads": ("threads.net", "threads.com"),
+}
+
+PLAT_ICON = {"youtube": "▶️", "facebook": "📘", "instagram": "📸", "tiktok": "🎵", "likee": "💃",
+             "twitter": "🐦", "snapchat": "👻", "pinterest": "📌", "soundcloud": "🎶", "threads": "🧵"}
+
+
+def detect(url):
+    host = (urlparse(url).netloc or "").lower().split(":")[0]
+    for key, doms in PLATS.items():
+        if any(host == d or host.endswith("." + d) for d in doms):
+            return key
+    return "other"
+
+
+def urls_from_message(m):
+    out = []
+    for txt, ents in ((m.text, m.entities), (m.caption, m.caption_entities)):
+        if not txt: continue
+        out += [u.rstrip(".,)،") for u in URL_RE.findall(txt)]
+        for e in ents or []:
+            if e.type == "text_link" and e.url: out.append(e.url)
+    return list(dict.fromkeys(out))
+
+
+# ---------------- التحميل (yt-dlp) ----------------
+class TooBig(Exception):
+    pass
+
+
+IMG_EXT = {"jpg", "jpeg", "png", "webp"}
+AUD_EXT = {"mp3", "m4a", "aac", "ogg", "opus", "wav"}
+
+
+def _find_file(outdir):
+    files = [os.path.join(outdir, f) for f in os.listdir(outdir)
+             if not f.endswith((".part", ".ytdl", ".json", ".temp"))]
+    return max(files, key=os.path.getsize) if files else None
+
+
+def _video_candidates(info, limit):
+    """يختار صيغ جاهزة (فيديو+صوت معاً) بدون علامة مائية وبحجم مناسب، من الأفضل للأقل."""
+    fmts = info.get("formats") or []
+    bad = set("/+[]()")
+
+    def size(f): return f.get("filesize") or f.get("filesize_approx")
+
+    def watermarked(f):
+        s = ((f.get("format_note") or "") + " " + str(f.get("format_id") or "")).lower()
+        return "watermark" in s or str(f.get("format_id")) == "download"
+
+    prog = [f for f in fmts if f.get("format_id") and f.get("vcodec") != "none" and f.get("acodec") != "none"
+            and not (set(str(f["format_id"])) & bad)]
+    clean = [f for f in prog if not watermarked(f)] or prog
+    ok = [f for f in clean if not size(f) or size(f) <= limit]
+    ok.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+    ids = [str(f["format_id"]) for f in ok[:3]]
+    if ids: return ids
+    if not prog and HAS_FFMPEG: return ["bv*[height<=720]+ba/b"]
+    return ["b/best"]
+
+
+def dl_sync(url, outdir, audio, limit):
+    opts = {"outtmpl": os.path.join(outdir, "%(extractor)s_%(id)s.%(ext)s"), "quiet": True, "no_warnings": True,
+            "noplaylist": True, "playlist_items": "1", "socket_timeout": 30, "retries": 3,
+            "restrictfilenames": True, "max_filesize": limit}
+    if os.path.exists(COOKIES): opts["cookiefile"] = COOKIES
+
+    info, last_ex = None, None
+    for _ in range(3):                      # تيك توك يفشل أحياناً عشوائياً، نعيد المحاولة
+        try:
+            with yt_dlp.YoutubeDL({**opts, "skip_download": True}) as y:
+                info = y.extract_info(url, download=False)
+            break
+        except yt_dlp.utils.DownloadError as e:
+            last_ex = e
+            time.sleep(1.5)
+    if info is None:
+        raise last_ex
+    if info.get("_type") == "playlist":
+        entries = [e for e in (info.get("entries") or []) if e]
+        if not entries: raise RuntimeError("no media found")
+        info = entries[0]
+
+    if audio:
+        if HAS_FFMPEG:
+            attempts = [("bestaudio/best", {"postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]})]
+        else:
+            attempts = [("bestaudio[ext=m4a]/bestaudio/best", {})]
+    else:
+        attempts = [(f, {}) for f in _video_candidates(info, limit)]
+
+    last_err, skipped = None, False
+    for fmt, extra in attempts:
+        for f in os.listdir(outdir):
+            try: os.remove(os.path.join(outdir, f))
+            except OSError: pass
+        failed = False
+        try:
+            with yt_dlp.YoutubeDL({**opts, "format": fmt, **extra}) as y:
+                try:
+                    # نستخدم المعلومات المستخرجة سابقاً دون إعادة جلب الصفحة (تفادي خطأ تيك توك)
+                    y.process_ie_result(y.sanitize_info(info), download=True)
+                except yt_dlp.utils.DownloadError:
+                    raise
+                except Exception:
+                    y.download([url])
+        except yt_dlp.utils.DownloadError as e:
+            last_err = e
+            failed = True
+        path = _find_file(outdir)       # حتى لو حصل خطأ بعد التنزيل نستفيد من الملف إن اكتمل
+        if not path and failed:
+            continue
+        if path and os.path.getsize(path) <= limit:
+            ext = path.rsplit(".", 1)[-1].lower()
+            kind = "photo" if ext in IMG_EXT else "audio" if ext in AUD_EXT else "video"
+            return {"path": path, "kind": kind, "title": info.get("title") or "video",
+                    "duration": info.get("duration"), "width": info.get("width"), "height": info.get("height"),
+                    "size": os.path.getsize(path)}
+        skipped = True
+    if skipped: raise TooBig()
+    raise last_err or RuntimeError("download failed")
+
+
+UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+
+
+def _fetch_file(u, path, limit):
+    import urllib.request
+    if u.startswith("/"): u = "https://www.tikwm.com" + u
+    req = urllib.request.Request(u, headers={"User-Agent": UA})
+    total = 0
+    with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as f:
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk: break
+            total += len(chunk)
+            if total > limit: raise TooBig()
+            f.write(chunk)
+    return total
+
+
+def tiktok_fallback(url, outdir, audio, limit):
+    """مسار بديل لتيك توك عبر خدمة tikwm (بدون علامة مائية) عند فشل yt-dlp."""
+    import json, urllib.request, urllib.parse
+    api = "https://www.tikwm.com/api/?hd=1&url=" + urllib.parse.quote(url, safe="")
+    req = urllib.request.Request(api, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "ignore"))
+    d = data.get("data") or {}
+    if data.get("code") != 0 or not d:
+        raise RuntimeError(f"tikwm: {data.get('msg')}")
+    for f in os.listdir(outdir):
+        try: os.remove(os.path.join(outdir, f))
+        except OSError: pass
+    title = d.get("title") or "TikTok"
+    if audio:
+        sources = [(d.get("music"), "mp3", "audio")]
+    else:
+        sources = [(d.get("hdplay"), "mp4", "video"), (d.get("play"), "mp4", "video")]
+    sources = [x for x in sources if x[0]]
+    if not sources:
+        raise RuntimeError("tikwm: no media (maybe photo post)")
+    too_big = False
+    for src, ext, kind in sources:
+        path = os.path.join(outdir, f"tiktok_{d.get('id', 'video')}.{ext}")
+        try:
+            size = _fetch_file(src, path, limit)
+        except TooBig:
+            too_big = True
+            continue
+        return {"path": path, "kind": kind, "title": title, "duration": d.get("duration"),
+                "width": None, "height": None, "size": size}
+    if too_big: raise TooBig()
+    raise RuntimeError("tikwm failed")
+
+
+def dl_any(url, outdir, audio, limit):
+    try:
+        return dl_sync(url, outdir, audio, limit)
+    except TooBig:
+        raise
+    except Exception as e:
+        if detect(url) != "tiktok":
+            raise
+        log.warning("yt-dlp فشل مع تيك توك، أجرّب المسار البديل: %s", str(e)[:120])
+        try:
+            return tiktok_fallback(url, outdir, audio, limit)
+        except TooBig:
+            raise
+        except Exception as e2:
+            raise RuntimeError(f"yt-dlp: {str(e)[:150]} | fallback: {str(e2)[:150]}")
+
+
+_sem = None
+busy = set()
+
+
+def get_sem():
+    global _sem
+    if _sem is None: _sem = asyncio.Semaphore(MAX_PARALLEL)
+    return _sem
+
+
+# ---------------- الاشتراك الإجباري ----------------
+_sub_cache = {}
+
+
+_ch_warned = {}
+
+
+async def missing_channels(bot, uid):
+    if is_admin(uid): return []
+    miss = []
+    for ch in channel_list(True):
+        if _sub_cache.get((uid, ch), 0) > time.time(): continue
+        try:
+            m = await bot.get_chat_member(ch, uid)
+            ok = m.status in ("member", "administrator", "creator") or (m.status == "restricted" and m.is_member)
+        except TelegramError as e:
+            log.warning("تعذّر فحص القناة %s (تأكد أن البوت مشرف فيها): %s", ch, e)
+            if flag("sub_notify", "1") and _ch_warned.get(ch, 0) < time.time():
+                _ch_warned[ch] = time.time() + 3600
+                asyncio.create_task(notify_admins(
+                    bot, f"⚠️ تعذّر فحص القناة {esc(ch)}، تأكد أن البوت مشرف فيها.\n<code>{esc(str(e)[:150])}</code>",
+                    parse_mode=HTML))
+            continue
+        if ok: _sub_cache[(uid, ch)] = time.time() + 120
+        else: miss.append(ch)
+    return miss
+
+
+def sub_btn(text, style=None, **kw):
+    """زر مع دعم نمط الألوان الجديد (إذا لم يدعمه تيليغرام يتجاهله بأمان)."""
+    if style and flag("sub_style", "0"):
+        kw["api_kwargs"] = {"style": style}
+    return IB(text, **kw)
+
+
+async def send_sub_prompt(bot, chat_id, uid, miss, rp=None):
+    text = S("sub_msg", "") or tr(uid, "sub_needed")
+    join = lambda ch: sub_btn(f"{tr(uid, 'b_join')} {ch}", style="primary", url=f"https://t.me/{ch.lstrip('@')}")
+    verify = []
+    if flag("sub_verify", "1"):
+        label = tr(uid, "b_chk")
+        if not flag("sub_icon_on", "1"): label = label.replace("✅ ", "")
+        verify = [[sub_btn(label, style="success", callback_data="chk")]]
+    if S("sub_display", "group") == "group":          # مجمّعة: رسالة واحدة بكل القنوات
+        kb = [[join(ch)] for ch in miss] + verify
+        await bot.send_message(chat_id, text, reply_markup=IM(kb), reply_parameters=rp)
+        return
+    for ch in miss:                                    # منفصلة: رسالة لكل قناة
+        await bot.send_message(chat_id, f"📢 {ch}", reply_markup=IM([[join(ch)]]), reply_parameters=rp)
+    await bot.send_message(chat_id, text, reply_markup=IM(verify) if verify else None, reply_parameters=rp)
+
+
+# ---------------- الواجهات ----------------
+def main_kb(uid, botname):
+    names = T[get_lang(uid)]["plat"]
+    kb, row = [], []
+    for k in PLATS:
+        if not flag(f"plat_{k}", "1"): continue
+        row.append(IB(f"{PLAT_ICON[k]} {names[k]}", callback_data=f"pf:{k}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row: kb.append(row)
+    if flag("plat_other", "1"):
+        kb.append([IB(tr(uid, "b_any"), callback_data="pf:any")])
+    kb.append([IB(tr(uid, "b_stats"), callback_data="me"),
+               IB(tr(uid, "b_help"), callback_data="help")])
+    kb.append([IB(tr(uid, "b_report"), callback_data="rep"), IB(tr(uid, "b_lang"), callback_data="lang")])
+    if botname:
+        kb.append([IB(tr(uid, "b_group"), url=f"https://t.me/{botname}?startgroup=true")])
+    return IM(kb)
+
+
+def welcome_payload(user, botname):
+    uid = user.id
+    custom = S("welcome", "")
+    if custom:
+        return custom.replace("{name}", user.first_name or ""), None, main_kb(uid, botname)
+    return tr(uid, "welcome", name=esc(user.first_name or "")), HTML, main_kb(uid, botname)
+
+
+async def show(q, context, text, mk=None, parse=HTML):
+    try:
+        await q.edit_message_text(text, parse_mode=parse, reply_markup=mk)
+    except BadRequest as e:
+        if "not modified" in str(e).lower(): return
+        await context.bot.send_message(q.from_user.id, text, parse_mode=parse, reply_markup=mk)
+
+
+async def safe_answer(q, text=None, alert=False):
+    try:
+        await q.answer(text, show_alert=alert)
+    except TelegramError:
+        pass
+
+
+async def notify_admins(bot, text, **kw):
+    for a in admin_ids():
+        try:
+            await bot.send_message(a, text, **kw)
+        except TelegramError:
+            pass
+
+
+# ---------------- التحميل من تيليغرام ----------------
+async def process_link(context, user, chat_id, reply_to, url, audio=False):
+    bot, uid = context.bot, user.id
+    rp = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
+
+    async def reply(text, **kw):
+        return await bot.send_message(chat_id, text, parse_mode=HTML, reply_parameters=rp, **kw)
+
+    if is_banned(uid): return await reply(tr(uid, "banned"))
+    if flag("maintenance") and not is_admin(uid): return await reply(tr(uid, "maint"))
+    try:
+        await asyncio.to_thread(validate_public_url, url)
+    except (ValueError, OSError):
+        return await reply(tr(uid, "err_url"))
+    p0 = detect(url)
+    if not flag(f"plat_{p0}", "1"):
+        nm = T[get_lang(uid)]["plat"].get(p0) or ("هذا الموقع" if get_lang(uid) == "ar" else "this site")
+        return await reply(tr(uid, "plat_off", p=nm))
+    miss = await missing_channels(bot, uid)
+    if miss: return await send_sub_prompt(bot, chat_id, uid, miss, rp)
+    limit = daily_limit()
+    if limit and not is_admin(uid) and today_count(uid) >= limit:
+        return await reply(tr(uid, "err_limit", n=limit))
+    if uid in busy: return await reply(tr(uid, "busy"))
+
+    busy.add(uid)
+    tmp = tempfile.mkdtemp(prefix="dl_")
+    plat = detect(url)
+    status = None
+    try:
+        status = await reply(tr(uid, "downloading"))
+        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+        async with get_sem():
+            res = await asyncio.wait_for(asyncio.to_thread(dl_any, url, tmp, audio, LIMIT_BYTES), timeout=600)
+        try:
+            await bot.edit_message_text(tr(uid, "uploading"), chat_id, status.message_id)
+        except TelegramError:
+            pass
+
+        cap = f"{tr(uid, 'caption')} • <b>{esc(str(res['title'])[:90])}</b>\n🤖 @{bot.username}"
+        kb = None
+        if res["kind"] == "video":
+            links = context.bot_data.setdefault("links", {})
+            token = secrets.token_hex(4)
+            links[token] = url
+            while len(links) > 300: links.pop(next(iter(links)))
+            kb = IM([[IB(tr(uid, "b_audio"), callback_data=f"aud:{token}")]])
+        common = dict(parse_mode=HTML, reply_parameters=rp, read_timeout=300, write_timeout=300, connect_timeout=30)
+        dur = int(res["duration"]) if res.get("duration") else None
+        with open(res["path"], "rb") as fh:
+            try:
+                if res["kind"] == "video":
+                    await bot.send_video(chat_id, fh, duration=dur,
+                                         width=int(res["width"]) if res.get("width") else None,
+                                         height=int(res["height"]) if res.get("height") else None,
+                                         caption=cap, supports_streaming=True, reply_markup=kb, **common)
+                elif res["kind"] == "audio":
+                    await bot.send_audio(chat_id, fh, duration=dur, title=str(res["title"])[:60], caption=cap, **common)
+                else:
+                    await bot.send_photo(chat_id, fh, caption=cap, **common)
+            except BadRequest:
+                fh.seek(0)
+                await bot.send_document(chat_id, fh, caption=cap, reply_markup=kb, **common)
+        run("INSERT INTO dl_log(uid,platform,url,ok,size) VALUES(?,?,?,1,?)", (uid, plat, safe_url_label(url), res["size"]))
+    except TooBig:
+        await reply(tr(uid, "err_toobig", mb=MAX_MB))
+        run("INSERT INTO dl_log(uid,platform,url,ok,err) VALUES(?,?,?,0,?)", (uid, plat, safe_url_label(url), "too big"))
+    except Exception as e:
+        err = str(e)
+        safe_err = safe_error_text(err)
+        log.warning("download failed [%s] %s: %s", plat, safe_url_label(url), safe_err)
+        low = err.lower()
+        private = any(k in low for k in ("login", "private", "cookies", "sign in", "confirm your age", "authentication"))
+        try:
+            await reply(tr(uid, "err_private" if private else "err_generic"))
+        except TelegramError:
+            pass
+        run("INSERT INTO dl_log(uid,platform,url,ok,err) VALUES(?,?,?,0,?)",
+            (uid, plat, safe_url_label(url), safe_err))
+    finally:
+        busy.discard(uid)
+        shutil.rmtree(tmp, ignore_errors=True)
+        if status:
+            try: await bot.delete_message(chat_id, status.message_id)
+            except TelegramError: pass
+
+
+# ---------------- الأوامر ----------------
+def timed(fn):
+    """يسجّل كل تفاعل (للإحصائيات: الرسائل / الجلسات / متوسط الاستجابة)."""
+    async def wrapper(update, context):
+        t0 = time.perf_counter()
+        try:
+            return await fn(update, context)
+        finally:
+            try:
+                u = update.effective_user
+                if u: run("INSERT INTO activity(uid,ms) VALUES(?,?)", (u.id, int((time.perf_counter() - t0) * 1000)))
+            except Exception:
+                pass
+    return wrapper
+
+
+async def refresh_private_commands(bot, uid):
+    if is_owner(uid):
+        commands = [BotCommand("start", "القائمة الرئيسية"), BotCommand("help", "طريقة الاستخدام"),
+                    BotCommand("admin", "لوحة الإدارة"),
+                    BotCommand("owner", "إدارة المالك والمشرفين"), BotCommand("stats", "الإحصائيات"),
+                    BotCommand("cancel", "إلغاء")]
+    elif is_admin(uid):
+        commands = [BotCommand("start", "القائمة الرئيسية"), BotCommand("help", "طريقة الاستخدام"),
+                    BotCommand("admin", "لوحة الإدارة"), BotCommand("stats", "الإحصائيات"),
+                    BotCommand("cancel", "إلغاء")]
+    else:
+        commands = [BotCommand("start", "القائمة الرئيسية / Menu"),
+                    BotCommand("help", "طريقة الاستخدام / How to use"),
+                    BotCommand("cancel", "إلغاء / Cancel")]
+    try:
+        await bot.set_my_commands(commands, scope=BotCommandScopeChat(uid))
+    except TelegramError as e:
+        log.warning("تعذّر ضبط قائمة الأوامر للمستخدم %s: %s", uid, str(e)[:200])
+
+
+@timed
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await refresh_private_commands(context.bot, user.id)
+    if is_banned(user.id): return
+    context.user_data.pop("state", None)
+    if register_user(user) and flag("join_notify", "1"):
+        context.application.create_task(notify_admins(
+            context.bot, f"🆕 مستخدم جديد: <b>{esc(user.full_name)}</b> (<code>{user.id}</code>)", parse_mode=HTML))
+    if flag("maintenance") and not is_admin(user.id):
+        return await update.message.reply_text(tr(user.id, "maint"))
+    miss = await missing_channels(context.bot, user.id)
+    if miss: return await send_sub_prompt(context.bot, update.effective_chat.id, user.id, miss)
+    text, parse, kb = welcome_payload(user, context.bot.username)
+    await update.message.reply_text(text, parse_mode=parse, reply_markup=kb)
+
+
+async def cmd_dl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m, user = update.effective_message, update.effective_user
+    if not m or not user: return
+    uid = user.id
+    register_user(user)
+    cmd = (m.text or "/d").split()[0].lstrip("/").split("@")[0].lower()
+    urls = urls_from_message(m)
+    if not urls and m.reply_to_message:
+        urls = urls_from_message(m.reply_to_message)
+    if not urls:
+        return await m.reply_text(tr(uid, "usage_cmd"), parse_mode=HTML)
+    await process_link(context, user, m.chat_id, m.message_id, urls[0], audio=(cmd == "a"))
+
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    await refresh_private_commands(context.bot, update.effective_user.id)
+    text, kb, parse = panel_payload(update.effective_user.id)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=parse)
+
+
+async def owner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        return await update.effective_message.reply_text(
+            "⛔ لم يتعرّف البوت على حسابك كمالك.\n"
+            "تحقّق من قيمة OWNER_ID في أسرار Replit ثم أعد تشغيل البوت.",
+            parse_mode=HTML)
+    await refresh_private_commands(context.bot, uid)
+    text, kb = owner_admins_payload()
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=HTML)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.effective_message.reply_text(tr(uid, "help"), parse_mode=HTML)
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    await update.message.reply_text(stats_text(), parse_mode=HTML)
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cm = update.my_chat_member
+    if not cm or cm.chat.type != "private": return
+    uid, st = cm.from_user.id, cm.new_chat_member.status
+    run("UPDATE users SET blocked=? WHERE id=?", (1 if st == "kicked" else 0, uid))
+    if st == "kicked" and flag("ban_notify", "1"):
+        await notify_admins(context.bot, f"🧱 <b>{esc(cm.from_user.full_name)}</b> (<code>{uid}</code>) حظر البوت.", parse_mode=HTML)
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("state", None)
+    await update.message.reply_text(tr(update.effective_user.id, "cancelled"))
+
+
+# ---------------- لوحة المشرف ----------------
+def stats_text():
+    c = lambda sql: one(sql)["c"]
+    users = c("SELECT COUNT(*) c FROM users")
+    new = c("SELECT COUNT(*) c FROM users WHERE date(joined)=date('now')")
+    banned = c("SELECT COUNT(*) c FROM users WHERE banned=1")
+    blocked = c("SELECT COUNT(*) c FROM users WHERE blocked=1")
+    active = c("SELECT COUNT(DISTINCT uid) c FROM dl_log WHERE date(ts)=date('now')")
+    ok = c("SELECT COUNT(*) c FROM dl_log WHERE ok=1 AND date(ts)=date('now')")
+    bad = c("SELECT COUNT(*) c FROM dl_log WHERE ok=0 AND date(ts)=date('now')")
+    total = c("SELECT COUNT(*) c FROM dl_log WHERE ok=1")
+    txt = (f"📊 <b>إحصائيات البوت</b>\n\n👥 المستخدمون: {users}\n🆕 جدد اليوم: {new}\n🔥 نشطون اليوم: {active}\n"
+           f"🚫 محظورون من طرفك: {banned}\n🧱 حاظرو البوت: {blocked}\n\n"
+           f"📥 تحميلات اليوم: {ok} ✅ | {bad} ❌\n📦 كل التحميلات: {total}\n")
+    pl = rows("SELECT platform, COUNT(*) c FROM dl_log WHERE ok=1 AND date(ts)=date('now') GROUP BY platform ORDER BY c DESC")
+    if pl: txt += "\n🌐 حسب المنصة اليوم:\n" + "\n".join(f"• {esc(p['platform'])}: {p['c']}" for p in pl)
+    return txt
+
+
+async def forward_to_admins(bot, m, user):
+    """يعرض للمشرفين كل رسالة يرسلها مستخدم مع أزرار رد وحظر."""
+    banned = is_banned(user.id)
+    kb = IM([[IB("✉️ رد", callback_data=f"a:reply:{user.id}"),
+              IB("♻️ فك الحظر" if banned else "🚫 حظر", callback_data=f"a:{'unbanq' if banned else 'banq'}:{user.id}")]])
+    uname = f"@{user.username}" if user.username else "بدون يوزر"
+    head = f"📨 <b>{esc(user.full_name)}</b> ({esc(uname)})\n🆔 <code>{user.id}</code>"
+    for a in admin_ids():
+        if a == user.id: continue
+        try:
+            if m.text:
+                await bot.send_message(a, f"{head}\n\n💬 {esc(m.text[:1000])}", parse_mode=HTML,
+                                       reply_markup=kb, disable_web_page_preview=True)
+            else:
+                await bot.send_message(a, head, parse_mode=HTML)
+                await bot.copy_message(a, m.chat_id, m.message_id, reply_markup=kb)
+        except TelegramError:
+            pass
+
+
+def panel_stats():
+    c = lambda sql: one(sql)["c"]
+    total = c("SELECT COUNT(*) c FROM users")
+    new = c("SELECT COUNT(*) c FROM users WHERE date(joined)=date('now')")
+    msgs = c("SELECT COUNT(*) c FROM activity WHERE date(ts)=date('now')")
+    sess = c("SELECT COUNT(DISTINCT uid || '-' || (CAST(strftime('%s', ts) AS INTEGER) / 1800)) c "
+             "FROM activity WHERE date(ts)=date('now')")
+    avg = one("SELECT AVG(ms) a FROM activity WHERE date(ts)=date('now') AND ms < 3000")["a"]
+    banned = c("SELECT COUNT(*) c FROM users WHERE banned=1")
+    blocked = c("SELECT COUNT(*) c FROM users WHERE blocked=1")
+    return (f"━━━ إحصائيات اليوم ━━━\n👥 الإجمالي: {total:,}\n🆕 مستخدمون جدد: {new}\n"
+            f"💬 الرسائل: {msgs}\n🔄 الجلسات: {sess}\n⚡ متوسط الاستجابة: {int(avg or 0)}ms\n"
+            f"🚫 المحظورون: {banned} | قاموا بحظر البوت: {blocked}")
+
+
+def panel_payload(uid=None):
+    on = lambda k, d="1": "✅" if flag(k, d) else "❌"
+    rows_kb = [
+        [IB("📊 إحصائيات مفصّلة", callback_data="a:stats"), IB("👥 المستخدمون", callback_data="a:users")],
+        [IB("🔐 الاشتراك", callback_data="a:subs"), IB("📢 التواصل", callback_data="a:bc")],
+        [IB("🌐 المنصات", callback_data="a:plats"), IB("⚙️ الإعدادات", callback_data="a:set")],
+        [IB("🛠 النظام والدعم", callback_data="a:sys"), IB("📝 المحتوى", callback_data="a:content")],
+    ]
+    if uid is not None and is_owner(uid):
+        rows_kb.append([IB("👑 إدارة المالك والمشرفين", callback_data="a:admins")])
+    rows_kb.extend([
+        [IB(f"{on('join_notify')} إشعار الدخول", callback_data="a:tg_join"),
+         IB(f"{on('ban_notify')} إشعار الحظر", callback_data="a:tg_ban")],
+        [IB(f"{on('show_msgs')} عرض رسائل المستخدمين لي", callback_data="a:tg_msgs")],
+        [IB(f"{on('daily_report')} تقرير يومي تلقائي", callback_data="a:tg_rep")],
+        [IB("❓ دليل الاستخدام", callback_data="a:guide")],
+    ])
+    kb = IM(rows_kb)
+    return "🤖 <b>لوحة التحكم</b>\n\n" + panel_stats(), kb, HTML
+
+
+def owner_admins_payload():
+    dynamic = {r["id"] for r in rows("SELECT id FROM admins")}
+    labels = []
+    kb = []
+    for aid in sorted(admin_ids()):
+        if aid == OWNER_ID:
+            source = "المالك"
+        elif aid in dynamic:
+            source = "مضاف من المالك"
+        else:
+            source = "من ADMIN_IDS"
+        labels.append(f"• <code>{aid}</code> — {source}")
+        if aid in dynamic:
+            kb.append([IB(f"🗑 حذف المشرف {aid}", callback_data=f"a:admindel:{aid}")])
+    kb.append([IB("➕ إضافة مشرف", callback_data="a:addadmin")])
+    kb.append([IB("🔙 لوحة الإدارة", callback_data="a:home")])
+    text = "👑 <b>إدارة المالك والمشرفين</b>\n\n" + "\n".join(labels or ["لا يوجد مشرفون"])
+    text += "\n\nالمعرّفات المضافة عبر متغير ADMIN_IDS لا يمكن حذفها من هنا."
+    return text, IM(kb)
+
+
+def back_kb(): return IM([[IB("🔙 رجوع", callback_data="a:home")]])
+
+
+async def broadcast(bot, admin_id, chat_id, message_id, mode="copy"):
+    ok = bad = 0
+    for u in rows("SELECT id FROM users WHERE banned=0 AND blocked=0"):
+        for attempt in (1, 2):
+            try:
+                if mode == "forward":
+                    await bot.forward_message(u["id"], chat_id, message_id)
+                else:
+                    await bot.copy_message(u["id"], chat_id, message_id)
+                ok += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                if attempt == 2: bad += 1
+            except Forbidden:
+                run("UPDATE users SET blocked=1 WHERE id=?", (u["id"],))
+                bad += 1
+                break
+            except TelegramError:
+                bad += 1
+                break
+        await asyncio.sleep(0.05)
+    await notify_admins(bot, f"📢 انتهت الإذاعة\n✅ نجح: {ok}\n❌ فشل: {bad}")
+
+
+_titles = {}
+
+
+async def ch_title(bot, ch):
+    if ch not in _titles:
+        try:
+            _titles[ch] = (await bot.get_chat(ch)).title or ch
+        except TelegramError:
+            _titles[ch] = ch
+    return _titles[ch]
+
+
+async def show_subs(q, context):
+    bot = context.bot
+    chs = rows("SELECT name, enabled FROM channels ORDER BY rowid")
+    on = lambda k, d="1": "✅" if flag(k, d) else "❌"
+    kb = []
+    for r in chs:
+        t = await ch_title(bot, r["name"])
+        kb.append([IB(f"{'✅' if r['enabled'] else '⛔'} 🔒 {t}"[:55], callback_data=f"a:togch:{r['name']}"),
+                   IB("🗑", callback_data=f"a:delch:{r['name']}")])
+    if len(chs) < MAX_CH:
+        kb.append([IB(f"➕ إضافة اشتراك جديد ({len(chs)}/{MAX_CH})", callback_data="a:addch")])
+    grouped = S("sub_display", "group") == "group"
+    kb += [
+        [IB("✅ تفعيل الكل", callback_data="a:chall:1"), IB("❌ تعطيل الكل", callback_data="a:chall:0")],
+        [IB("👁 معاينة البوابة", callback_data="a:preview")],
+        [IB("─── الإعدادات ───", callback_data="noop")],
+        [IB(f"{on('sub_notify')} الإشعار", callback_data="a:tg_sn")],
+        [IB("─── العرض ───", callback_data="noop")],
+        [IB(f"📋 العرض: {'مجمّعة' if grouped else 'منفصلة'}", callback_data="a:sub_disp"),
+         IB(f"🔘 زر التحقق {on('sub_verify')}", callback_data="a:tg_sv")],
+        [IB(f"😀 أيقونة زر التحقق {on('sub_icon_on')}", callback_data="a:tg_si"),
+         IB(f"🎨 النمط {on('sub_style', '0')}", callback_data="a:tg_ss")],
+        [IB("✏️ رسالة العرض المُجمَّع", callback_data="a:setsubmsg"), IB("❓ شرح القسم", callback_data="a:subhelp")],
+        [IB("🔙 رجوع", callback_data="a:home")],
+    ]
+    n_on = sum(1 for r in chs if r["enabled"])
+    txt = f"🔐 <b>الاشتراك الإجباري</b>\n\n📋 الاشتراكات: {n_on}/{len(chs)} مفعّلة\n⚠️ يجب أن يكون البوت مشرفاً في كل قناة."
+    return await show(q, context, txt, IM(kb))
+
+
+async def show_plats(q, context):
+    names = T["ar"]["plat"]
+    on = lambda k: "✅" if flag(k, "1") else "❌"
+    kb, row = [], []
+    for k in PLATS:
+        row.append(IB(f"{PLAT_ICON[k]} {names[k]} {on('plat_' + k)}", callback_data=f"a:tgp:{k}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row: kb.append(row)
+    kb += [[IB(f"🌐 جميع المواقع {on('plat_other')}", callback_data="a:tgp:other")],
+           [IB(f"👥 اكتشاف الروابط بالمجموعات {on('grp_detect')}", callback_data="a:tgp:grp")],
+           [IB("✅ تفعيل الكل", callback_data="a:tgp:on"), IB("❌ تعطيل الكل", callback_data="a:tgp:off")],
+           [IB("🔙 رجوع", callback_data="a:home")]]
+    return await show(q, context, "⚙️ <b>إعدادات المنصات</b>\n\nتفعيل/تعطيل التحميل من كل منصة:", IM(kb))
+
+
+def _pip_update():
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+                       capture_output=True, text=True, timeout=300)
+    return (r.stdout + r.stderr)[-600:]
+
+
+async def handle_admin_cb(q, context, uid, sub, rest):
+    bot = context.bot
+    ST = lambda kind, ref=None: context.user_data.__setitem__("state", (kind, ref))
+
+    if sub in ("admins", "addadmin", "admindel") and not is_owner(uid):
+        return ("⛔ هذا القسم متاح للمالك فقط.", True)
+    if sub == "admins":
+        text, kb = owner_admins_payload()
+        return await show(q, context, text, kb)
+    if sub == "addadmin":
+        ST("admin_add")
+        return await bot.send_message(uid, "➕ أرسل معرّف المستخدم الرقمي لإضافته مشرفاً.\n\n/cancel للإلغاء")
+    if sub == "admindel":
+        if not rest.isdigit():
+            return ("معرّف غير صالح.", True)
+        target = int(rest)
+        if target == OWNER_ID:
+            return ("لا يمكن حذف المالك.", True)
+        if not one("SELECT 1 FROM admins WHERE id=?", (target,)):
+            return ("هذا المشرف غير موجود في قائمة الإضافات.", True)
+        run("DELETE FROM admins WHERE id=?", (target,))
+        await refresh_private_commands(bot, target)
+        text, kb = owner_admins_payload()
+        await show(q, context, text, kb)
+        return ("✅ تم حذف المشرف.", False)
+
+    if sub == "home":
+        return await show(q, context, *panel_payload(uid)[:2])
+    if sub == "tg_join":
+        set_S("join_notify", "0" if flag("join_notify", "1") else "1")
+        return await show(q, context, *panel_payload(uid)[:2])
+    if sub == "tg_ban":
+        set_S("ban_notify", "0" if flag("ban_notify", "1") else "1")
+        return await show(q, context, *panel_payload(uid)[:2])
+    if sub == "tg_msgs":
+        set_S("show_msgs", "0" if flag("show_msgs", "1") else "1")
+        return await show(q, context, *panel_payload(uid)[:2])
+
+    if sub == "tg_rep":
+        set_S("daily_report", "0" if flag("daily_report", "1") else "1")
+        return await show(q, context, *panel_payload(uid)[:2])
+
+    if sub == "stats":
+        return await show(q, context, stats_text(), back_kb())
+
+    if sub == "users":
+        kb = IM([[IB("📋 آخر 30 مستخدم", callback_data="a:ulist"), IB("🏆 الأكثر تحميلاً", callback_data="a:top")],
+                 [IB("🔎 بحث بالـID", callback_data="a:find")],
+                 [IB("🚫 حظر بالـID", callback_data="a:ban"), IB("♻️ فك حظر بالـID", callback_data="a:unban")],
+                 [IB("🔙 رجوع", callback_data="a:home")]])
+        return await show(q, context, "👥 <b>المستخدمون</b>", kb)
+    if sub == "ulist":
+        us = rows("SELECT id,name,banned FROM users ORDER BY joined DESC LIMIT 30")
+        txt = "📋 <b>آخر 30 مستخدم:</b>\n\n" + "\n".join(
+            f"{i}. {'🚫 ' if u['banned'] else ''}{esc(u['name'] or '-')} (<code>{u['id']}</code>)" for i, u in enumerate(us, 1))
+        return await show(q, context, txt if us else "لا يوجد", IM([[IB("🔙 رجوع", callback_data="a:users")]]))
+    if sub == "top":
+        us = rows("SELECT d.uid, COUNT(*) c, u.name FROM dl_log d LEFT JOIN users u ON u.id=d.uid "
+                  "WHERE d.ok=1 GROUP BY d.uid ORDER BY c DESC LIMIT 10")
+        txt = "🏆 <b>أكثر 10 مستخدمين تحميلاً:</b>\n\n" + "\n".join(
+            f"{i}. {esc(u['name'] or '-')} (<code>{u['uid']}</code>) — {u['c']}" for i, u in enumerate(us, 1))
+        return await show(q, context, txt if us else "لا يوجد", IM([[IB("🔙 رجوع", callback_data="a:users")]]))
+    if sub == "find":
+        ST("find_user")
+        return await bot.send_message(uid, "🔎 أرسل ID المستخدم:\n\n/cancel للإلغاء")
+    if sub in ("ban", "unban"):
+        ST(sub + "_id")
+        return await bot.send_message(uid, "أرسل ID المستخدم (أرقام):\n\n/cancel للإلغاء")
+    if sub in ("banq", "unbanq"):
+        t = int(rest)
+        ban = sub == "banq"
+        if ban and is_admin(t): return ("لا يمكن حظر مشرف", True)
+        run("UPDATE users SET banned=? WHERE id=?", (1 if ban else 0, t))
+        kb = IM([[IB("✉️ رد", callback_data=f"a:reply:{t}"),
+                  IB("♻️ فك الحظر" if ban else "🚫 حظر", callback_data=f"a:{'unbanq' if ban else 'banq'}:{t}")]])
+        try: await q.edit_message_reply_markup(reply_markup=kb)
+        except TelegramError: pass
+        if flag("ban_notify", "1"):
+            try: await bot.send_message(t, tr(t, "banned") if ban else "✅ تم فك الحظر عنك.")
+            except TelegramError: pass
+        return ("🚫 تم الحظر" if ban else "♻️ تم فك الحظر", False)
+
+    if sub == "subs":
+        return await show_subs(q, context)
+    SUBTG = {"tg_sn": ("sub_notify", "1"), "tg_sv": ("sub_verify", "1"),
+             "tg_si": ("sub_icon_on", "1"), "tg_ss": ("sub_style", "0")}
+    if sub in SUBTG:
+        k, d = SUBTG[sub]
+        set_S(k, "0" if flag(k, d) else "1")
+        return await show_subs(q, context)
+    if sub == "togch":
+        run("UPDATE channels SET enabled=1-enabled WHERE name=?", (rest,))
+        return await show_subs(q, context)
+    if sub == "chall":
+        run("UPDATE channels SET enabled=?", (1 if rest == "1" else 0,))
+        return await show_subs(q, context)
+    if sub == "sub_disp":
+        set_S("sub_display", "single" if S("sub_display", "group") == "group" else "group")
+        return await show_subs(q, context)
+    if sub == "addch":
+        if len(channel_list()) >= MAX_CH:
+            return (f"وصلت للحد الأقصى ({MAX_CH})", True)
+        ST("add_ch")
+        return await bot.send_message(uid, "أرسل يوزر القناة مثل <code>@mychannel</code>\n\n/cancel للإلغاء", parse_mode=HTML)
+    if sub == "delch":
+        run("DELETE FROM channels WHERE name=?", (rest,))
+        return await show_subs(q, context)
+    if sub == "preview":
+        chs = channel_list(True)
+        if not chs: return ("لا توجد قنوات مفعّلة", True)
+        await bot.send_message(uid, "👁 <b>هذه معاينة لما يراه المستخدم:</b>", parse_mode=HTML)
+        return await send_sub_prompt(bot, uid, uid, chs)
+    if sub == "setsubmsg":
+        ST("set_sub_msg")
+        return await bot.send_message(uid, "✏️ أرسل نص رسالة بوابة الاشتراك (نص عادي).\nأرسل <code>-</code> للرجوع للنص الافتراضي.\n\n/cancel للإلغاء", parse_mode=HTML)
+    if sub == "subhelp":
+        txt = ("❓ <b>شرح قسم الاشتراك</b>\n\n"
+               f"• أضف البوت مشرفاً في القناة ثم أضفها هنا (حد أقصى {MAX_CH}).\n"
+               "• الضغط على اسم القناة يفعّلها/يعطّلها مؤقتاً دون حذفها، و🗑 للحذف.\n"
+               "• العرض <b>مجمّعة</b>: رسالة واحدة بكل القنوات، <b>منفصلة</b>: رسالة لكل قناة.\n"
+               "• زر التحقق وأيقونته: إظهار/إخفاء زر «تحققت».\n"
+               "• النمط: تلوين الأزرار (يعمل فقط إذا كان تيليغرام يدعمه عندك).\n"
+               "• الإشعار: ينبهك إذا فقد البوت صلاحية فحص قناة.\n"
+               "• معاينة البوابة: ترى بالضبط ما يراه المستخدم.")
+        return await show(q, context, txt, IM([[IB("🔙 رجوع", callback_data="a:subs")]]))
+
+    if sub == "plats":
+        return await show_plats(q, context)
+    if sub == "tgp":
+        if rest == "grp":
+            set_S("grp_detect", "0" if flag("grp_detect", "1") else "1")
+        elif rest in PLATS or rest == "other":
+            set_S(f"plat_{rest}", "0" if flag(f"plat_{rest}", "1") else "1")
+        elif rest in ("on", "off"):
+            for p in list(PLATS) + ["other"]:
+                set_S(f"plat_{p}", "1" if rest == "on" else "0")
+        return await show_plats(q, context)
+
+    if sub == "bc":
+        n = one("SELECT COUNT(*) c FROM users WHERE banned=0 AND blocked=0")["c"]
+        kb = IM([[IB("⚡ إذاعة سريعة", callback_data="a:bcq")],
+                 [IB("📣 الإذاعة", callback_data="a:bcc")],
+                 [IB("↩️ توجيه الرسائل", callback_data="a:bcf")],
+                 [IB("🔙 رجوع", callback_data="a:home")]])
+        return await show(q, context, f"📢 <b>التواصل</b>\n\nإدارة الإذاعة والتوجيه والنشر\n👥 سيصل لحوالي {n:,} مستخدم", kb)
+    if sub in ("bcq", "bcc", "bcf"):
+        ST({"bcq": "bc_quick", "bcc": "bc", "bcf": "bc_fwd"}[sub])
+        hint = {"bcq": "⚡ أرسل رسالة وتُرسل <b>فوراً</b> بدون تأكيد",
+                "bcc": "📣 أرسل الرسالة (نص/صورة/فيديو/ملف) وسأطلب تأكيدك قبل الإرسال",
+                "bcf": "↩️ أرسل (أو وجّه) رسالة وتصل للجميع كرسالة <b>موجَّهة</b> مع اسم المصدر"}[sub]
+        return await bot.send_message(uid, hint + "\n\n/cancel للإلغاء", parse_mode=HTML)
+    if sub == "bcgo":
+        pend = context.user_data.pop("bc_pending", None)
+        if not pend: return ("انتهت الصلاحية، أعد المحاولة", True)
+        await show(q, context, "📢 بدأت الإذاعة في الخلفية، سأخبرك عند الانتهاء.")
+        context.application.create_task(broadcast(bot, uid, *pend))
+        return
+    if sub == "bcno":
+        context.user_data.pop("bc_pending", None)
+        return await show(q, context, "تم الإلغاء ✅")
+
+    if sub == "set":
+        lim = daily_limit()
+        txt = (f"⚙️ <b>الإعدادات</b>\n\n📥 الحد اليومي لكل مستخدم: {lim if lim else 'بلا حد'}\n"
+               f"🛠 وضع الصيانة: {'مفعّل' if flag('maintenance') else 'معطّل'}\n📦 أقصى حجم للرفع: {MAX_MB}MB")
+        kb = IM([[IB("✏️ تغيير الحد اليومي", callback_data="a:setlim")],
+                 [IB("🛠 تبديل وضع الصيانة", callback_data="a:maint")],
+                 [IB("🔙 رجوع", callback_data="a:home")]])
+        return await show(q, context, txt, kb)
+    if sub == "setlim":
+        ST("set_limit")
+        return await bot.send_message(uid, "أرسل الحد اليومي (رقم، 0 = بلا حد):\n\n/cancel للإلغاء")
+    if sub == "maint":
+        set_S("maintenance", "0" if flag("maintenance") else "1")
+        return await handle_admin_cb(q, context, uid, "set", "")
+
+    if sub == "sys":
+        try: ver = yt_dlp.version.__version__
+        except Exception: ver = "?"
+        txt = (f"🛠 <b>النظام والدعم</b>\n\n🎞 yt-dlp: <code>{ver}</code>\n"
+               f"🎬 ffmpeg: {'متوفر ✅' if HAS_FFMPEG else 'غير متوفر ❌'}\n"
+               f"🍪 cookies.txt: {'موجود ✅' if os.path.exists(COOKIES) else 'غير موجود'}\n"
+               f"⚙️ تحميلات متزامنة: {MAX_PARALLEL}")
+        kb = IM([[IB("🔄 تحديث yt-dlp", callback_data="a:upd"), IB("♻️ إعادة تشغيل", callback_data="a:restart")],
+                 [IB("🍪 رفع كوكيز", callback_data="a:cookies"), IB("🧾 آخر الأخطاء", callback_data="a:errs")],
+                 [IB("💾 نسخة احتياطية", callback_data="a:backup")],
+                 [IB("🔙 رجوع", callback_data="a:home")]])
+        return await show(q, context, txt, kb)
+    if sub == "upd":
+        await bot.send_message(uid, "🔄 جاري التحديث، انتظر...")
+        try:
+            out = await asyncio.to_thread(_pip_update)
+        except Exception as e:
+            out = f"فشل: {e}"
+        return await bot.send_message(uid, f"<pre>{esc(out)}</pre>\nبعد التحديث اضغط «إعادة تشغيل».", parse_mode=HTML)
+    if sub == "restart":
+        await safe_answer(q, "♻️ جاري إعادة التشغيل...")
+        await bot.send_message(uid, "♻️ جاري إعادة التشغيل...")
+        db.commit()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    if sub == "cookies":
+        ST("cookies")
+        return await bot.send_message(
+            uid, "🍪 أرسل ملف <code>cookies.txt</code> (بصيغة Netscape) مصدّراً من متصفحك.\n"
+                 "يفيد مع الإنستغرام والفيسبوك واليوتيوب عند طلب تسجيل الدخول.\n\n/cancel للإلغاء", parse_mode=HTML)
+    if sub == "errs":
+        es = rows("SELECT platform,url,err,ts FROM dl_log WHERE ok=0 ORDER BY id DESC LIMIT 8")
+        if not es: return await show(q, context, "لا توجد أخطاء 🎉", IM([[IB("🔙 رجوع", callback_data="a:sys")]]))
+        txt = "🧾 <b>آخر الأخطاء:</b>\n\n" + "\n\n".join(
+            f"• <b>{esc(e['platform'])}</b> {e['ts']}\n{esc((e['url'] or '')[:80])}\n<code>{esc((e['err'] or '')[:160])}</code>" for e in es)
+        return await show(q, context, txt, IM([[IB("🔙 رجوع", callback_data="a:sys")]]))
+    if sub == "backup":
+        import tempfile as _t
+        tmpf = _t.NamedTemporaryFile(suffix=".db", delete=False)
+        tmpf.close()
+        try:
+            dst = sqlite3.connect(tmpf.name)
+            db.backup(dst)
+            dst.close()
+            with open(tmpf.name, "rb") as f:
+                await bot.send_document(uid, f, filename=f"backup_{date.today().isoformat()}.db", caption="💾 نسخة احتياطية")
+        finally:
+            os.unlink(tmpf.name)
+        return
+
+    if sub == "content":
+        kb = IM([[IB("✏️ تعديل رسالة الترحيب", callback_data="a:setwel")],
+                 [IB("↩️ رجوع للافتراضية", callback_data="a:resetwel")],
+                 [IB("🔙 رجوع", callback_data="a:home")]])
+        return await show(q, context, "📝 <b>المحتوى</b>\n\nيمكنك تخصيص رسالة الترحيب. استخدم <code>{name}</code> لاسم المستخدم.", kb)
+    if sub == "setwel":
+        ST("set_welcome")
+        return await bot.send_message(uid, "أرسل نص رسالة الترحيب الجديدة (نص عادي):\n\n/cancel للإلغاء")
+    if sub == "resetwel":
+        set_S("welcome", "")
+        return ("↩️ رجعت للرسالة الافتراضية", False)
+
+    if sub == "guide":
+        txt = ("❓ <b>دليل الاستخدام</b>\n\n"
+               "• <b>الاشتراك:</b> أضف البوت مشرفاً في القناة ثم أضفها من «الاشتراك».\n"
+               "• <b>الحد اليومي:</b> من «الإعدادات»، والمشرفون بلا حد.\n"
+               "• <b>إذا فشل منصة ما:</b> حدّث yt-dlp ثم أعد التشغيل.\n"
+               "• <b>الإنستغرام/يوتيوب:</b> قد يحتاجان cookies.txt على السيرفرات.\n"
+               "• <b>الإشعارات:</b> «إشعار الدخول» يخبرك بكل مستخدم جديد، و«إشعار الحظر» يخبر المستخدم عند حظره.\n"
+               "• <b>التواصل:</b> الإذاعة ترسل لكل المستخدمين غير المحظورين، والسريعة بدون تأكيد، والتوجيه يُظهر المصدر.\n"
+               "• <b>المنصات:</b> عطّل أي منصة من «المنصات» فتختفي من القائمة ويُرفض رابطها.\n"
+               "• <b>المجموعات:</b> «اكتشاف الروابط» يحمّل تلقائياً روابط المنصات المعروفة (اجعل البوت مشرفاً بالمجموعة).\n"
+               "• <b>التقرير اليومي:</b> يصلك ملخص آخر اليوم تلقائياً.")
+        return await show(q, context, txt, back_kb())
+
+    if sub == "reply":
+        ST("reply", int(rest))
+        return await bot.send_message(uid, "✉️ اكتب الرد:\n\n/cancel للإلغاء")
+
+
+# ---------------- الأزرار ----------------
+@timed
+async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    uid = q.from_user.id
+    if is_banned(uid):
+        return await safe_answer(q, tr(uid, "banned"), True)
+    act, _, arg = q.data.partition(":")
+    if act != "chk" and not is_admin(uid) and await missing_channels(context.bot, uid):
+        return await safe_answer(q, tr(uid, "not_yet"), True)
+    try:
+        res = await handle_cb(q, context, uid, act, arg)
+    except Exception:
+        log.exception("callback error: %s", q.data)
+        res = ("⚠️ Error", True)
+    text, alert = res if isinstance(res, tuple) else (None, False)
+    await safe_answer(q, text, alert)
+
+
+async def handle_cb(q, context, uid, act, arg):
+    bot, user = context.bot, q.from_user
+    botname = bot.username
+
+    if act == "noop": return
+    if act == "chk":
+        if await missing_channels(bot, uid):
+            return (tr(uid, "not_yet"), True)
+        try: await q.message.delete()
+        except TelegramError: pass
+        text, parse, kb = welcome_payload(user, botname)
+        return await bot.send_message(uid, text, parse_mode=parse, reply_markup=kb)
+
+    if act == "home":
+        text, parse, kb = welcome_payload(user, botname)
+        return await show(q, context, text, kb, parse)
+
+    if act == "pf":
+        names = T[get_lang(uid)]["plat"]
+        text = tr(uid, "tip_any") if arg == "any" else tr(uid, "tip", p=names.get(arg, arg))
+        return await show(q, context, text, IM([[IB(tr(uid, "b_back"), callback_data="home")]]))
+
+    if act == "help":
+        return await show(q, context, tr(uid, "help"),
+                          IM([[IB(tr(uid, "b_back"), callback_data="home")]]))
+
+    if act == "me":
+        total = one("SELECT COUNT(*) c FROM dl_log WHERE uid=? AND ok=1", (uid,))["c"]
+        lim = daily_limit()
+        u = one("SELECT joined FROM users WHERE id=?", (uid,))
+        text = tr(uid, "stats_me", total=total, today=today_count(uid), limit=lim if lim else "∞",
+                  joined=(u["joined"][:10] if u else "-"))
+        return await show(q, context, text, IM([[IB(tr(uid, "b_back"), callback_data="home")]]))
+
+    if act == "lang":
+        kb = IM([[IB("🇮🇶 العربية", callback_data="setlang:ar"), IB("🇬🇧 English", callback_data="setlang:en")]])
+        return await show(q, context, tr(uid, "choose_lang"), kb)
+
+    if act == "setlang":
+        if arg in ("ar", "en"): run("UPDATE users SET lang=? WHERE id=?", (arg, uid))
+        text, parse, kb = welcome_payload(user, botname)
+        await show(q, context, text, kb, parse)
+        return (tr(uid, "lang_set"), False)
+
+    if act == "rep":
+        context.user_data["state"] = ("report", None)
+        return await bot.send_message(uid, tr(uid, "report_prompt"))
+
+    if act == "aud":
+        url = context.bot_data.get("links", {}).get(arg)
+        if not url: return ("⌛ انتهت صلاحية الزر، أرسل الرابط مجدداً", True)
+        await safe_answer(q, "🎵 ...")
+        return await process_link(context, user, q.message.chat_id, q.message.message_id, url, audio=True)
+
+    if act == "a":
+        if not is_admin(uid): return ("⛔", True)
+        sub, _, rest = arg.partition(":")
+        return await handle_admin_cb(q, context, uid, sub, rest)
+
+
+# ---------------- الرسائل الخاصة ----------------
+async def handle_state(update, context):
+    m, uid = update.message, update.message.from_user.id
+    text = (m.text or "").strip()
+    kind, ref = context.user_data["state"]
+    adm = is_admin(uid)
+    if kind != "report" and not adm:
+        context.user_data.pop("state", None)
+        return False
+    if kind == "admin_add" and not is_owner(uid):
+        context.user_data.pop("state", None)
+        return False
+    done = lambda: context.user_data.pop("state", None)
+
+    if kind == "report":
+        done()
+        kb = IM([[IB("✉️ رد", callback_data=f"a:reply:{uid}"), IB("🚫 حظر", callback_data=f"a:banq:{uid}")]])
+        head = f"🆘 بلاغ من <b>{esc(m.from_user.full_name)}</b> (<code>{uid}</code>)"
+        for a in admin_ids():
+            try:
+                if m.text:
+                    await context.bot.send_message(a, f"{head}\n\n{esc(text[:800])}", parse_mode=HTML, reply_markup=kb)
+                else:
+                    await context.bot.send_message(a, head, parse_mode=HTML)
+                    await context.bot.copy_message(a, m.chat_id, m.message_id, reply_markup=kb)
+            except TelegramError:
+                pass
+        await m.reply_text(tr(uid, "report_sent"))
+        return True
+
+    if kind in ("bc", "bc_fwd", "bc_quick"):
+        done()
+        mode = "forward" if kind == "bc_fwd" else "copy"
+        if kind == "bc_quick":
+            await m.reply_text("⚡ بدأت الإذاعة السريعة، سأخبرك عند الانتهاء.")
+            context.application.create_task(broadcast(context.bot, uid, m.chat_id, m.message_id, mode))
+            return True
+        context.user_data["bc_pending"] = (m.chat_id, m.message_id, mode)
+        n = one("SELECT COUNT(*) c FROM users WHERE banned=0 AND blocked=0")["c"]
+        kb = IM([[IB(f"✅ إرسال لـ {n:,}", callback_data="a:bcgo"), IB("❌ إلغاء", callback_data="a:bcno")]])
+        await m.reply_text("👆 هذه الرسالة ستُرسل لكل المستخدمين. تأكيد؟", reply_markup=kb,
+                           reply_parameters=ReplyParameters(message_id=m.message_id))
+        return True
+
+    if kind == "admin_add":
+        if not text.isdigit():
+            await m.reply_text("⚠️ أرسل معرّفاً رقمياً صحيحاً.")
+            return True
+        target = int(text)
+        if target == OWNER_ID or is_admin(target):
+            await m.reply_text("ℹ️ هذا المستخدم لديه صلاحية مشرف بالفعل.")
+            done()
+            return True
+        run("INSERT OR IGNORE INTO admins(id,added_by) VALUES(?,?)", (target, uid))
+        await refresh_private_commands(context.bot, target)
+        done()
+        await m.reply_text(f"✅ تمت إضافة <code>{target}</code> إلى المشرفين.", parse_mode=HTML)
+        return True
+
+    if kind == "cookies":
+        if not m.document:
+            await m.reply_text("⚠️ أرسل الملف كمستند، أو /cancel.")
+            return True
+        if (m.document.file_size or 0) > 3_000_000:
+            await m.reply_text("⚠️ الملف كبير جداً.")
+            return True
+        f = await context.bot.get_file(m.document.file_id)
+        await f.download_to_drive(COOKIES)
+        try:
+            os.chmod(COOKIES, 0o600)
+        except OSError:
+            pass
+        done()
+        await m.reply_text("✅ تم حفظ cookies.txt وسيُستخدم تلقائياً.")
+        return True
+
+    if not text:
+        await m.reply_text("⚠️ أرسل نصاً من فضلك (أو /cancel).")
+        return True
+
+    if kind in ("ban_id", "unban_id"):
+        if not text.isdigit():
+            await m.reply_text("⚠️ أرسل رقم ID صحيح.")
+            return True
+        target, ban = int(text), kind == "ban_id"
+        if ban and is_admin(target):
+            await m.reply_text("⛔ لا يمكن حظر مشرف.")
+            done()
+            return True
+        run("UPDATE users SET banned=? WHERE id=?", (1 if ban else 0, target))
+        done()
+        await m.reply_text("🚫 تم الحظر" if ban else "♻️ تم فك الحظر")
+        if flag("ban_notify", "1"):
+            try:
+                await context.bot.send_message(target, tr(target, "banned") if ban else "✅ تم فك الحظر عنك.")
+            except TelegramError:
+                pass
+    elif kind == "add_ch":
+        if len(channel_list()) >= MAX_CH:
+            await m.reply_text(f"⚠️ وصلت للحد الأقصى ({MAX_CH} قنوات).")
+            done()
+            return True
+        ch = text.replace("https://t.me/", "").replace("t.me/", "").strip().lstrip("@")
+        ch = "@" + ch
+        try:
+            me = await context.bot.get_chat_member(ch, context.bot.id)
+            if me.status not in ("administrator", "creator"):
+                await m.reply_text("⚠️ البوت ليس مشرفاً في هذه القناة. اجعله مشرفاً ثم أعد المحاولة.")
+                return True
+        except TelegramError as e:
+            await m.reply_text(f"⚠️ تعذّر الوصول للقناة: {e}")
+            return True
+        run("INSERT OR IGNORE INTO channels(name) VALUES(?)", (ch,))
+        done()
+        await m.reply_text(f"✅ تمت إضافة {ch}")
+    elif kind == "set_limit":
+        if not text.isdigit():
+            await m.reply_text("⚠️ أرسل رقماً.")
+            return True
+        set_S("daily_limit", text); done()
+        await m.reply_text("✅ تم الحفظ")
+    elif kind == "set_welcome":
+        set_S("welcome", text[:1500]); done()
+        await m.reply_text("✅ تم حفظ رسالة الترحيب")
+    elif kind == "set_sub_msg":
+        set_S("sub_msg", "" if text == "-" else text[:1000]); done()
+        await m.reply_text("✅ تم الحفظ" if text != "-" else "↩️ رجعت للنص الافتراضي")
+    elif kind == "find_user":
+        if not text.isdigit():
+            await m.reply_text("⚠️ أرسل رقم ID صحيح.")
+            return True
+        u = one("SELECT * FROM users WHERE id=?", (int(text),))
+        done()
+        if not u:
+            await m.reply_text("❌ المستخدم غير موجود")
+            return True
+        total = one("SELECT COUNT(*) c FROM dl_log WHERE uid=? AND ok=1", (u["id"],))["c"]
+        kb = IM([[IB("✉️ رد", callback_data=f"a:reply:{u['id']}"),
+                  IB("♻️ فك الحظر" if u["banned"] else "🚫 حظر",
+                     callback_data=f"a:{'unbanq' if u['banned'] else 'banq'}:{u['id']}")]])
+        await m.reply_text(
+            f"👤 <b>{esc(u['name'] or '-')}</b>\n🆔 <code>{u['id']}</code>\n📆 انضم: {(u['joined'] or '')[:10]}\n"
+            f"📥 تحميلات ناجحة: {total}\n🚫 محظور: {'نعم' if u['banned'] else 'لا'}\n"
+            f"🧱 حاظر البوت: {'نعم' if u['blocked'] else 'لا'}", parse_mode=HTML, reply_markup=kb)
+    elif kind == "reply":
+        done()
+        try:
+            await context.bot.send_message(ref, f"{tr(ref, 'from_admin')}\n\n{esc(text)}", parse_mode=HTML)
+            await m.reply_text("✅ تم الإرسال")
+        except Forbidden:
+            run("UPDATE users SET blocked=1 WHERE id=?", (ref,))
+            await m.reply_text("⚠️ هذا المستخدم حظر البوت، لا يمكن إرسال رد له.")
+        except TelegramError:
+            await m.reply_text("⚠️ فشل الإرسال")
+    else:
+        done()
+        return False
+    return True
+
+
+@timed
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    if not m or not m.from_user: return
+    user = m.from_user
+    uid = user.id
+    if is_banned(uid): return
+    if register_user(user) and flag("join_notify", "1"):
+        context.application.create_task(notify_admins(
+            context.bot, f"🆕 مستخدم جديد: <b>{esc(user.full_name)}</b> (<code>{uid}</code>)", parse_mode=HTML))
+
+    if context.user_data.get("state") and await handle_state(update, context):
+        return
+    if not is_admin(uid) and flag("show_msgs", "1"):
+        context.application.create_task(forward_to_admins(context.bot, m, user))
+    if flag("maintenance") and not is_admin(uid):
+        return await m.reply_text(tr(uid, "maint"))
+    miss = await missing_channels(context.bot, uid)
+    if miss: return await send_sub_prompt(context.bot, m.chat_id, uid, miss)
+
+    urls = urls_from_message(m)
+    if urls:
+        return await process_link(context, user, m.chat_id, m.message_id, urls[0])
+    await m.reply_text(tr(uid, "no_link"))
+
+
+# ---------------- المجموعات ----------------
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اكتشاف روابط المنصات المعروفة داخل المجموعات وتحميلها تلقائياً."""
+    m = update.message
+    if not m or not m.from_user or m.from_user.is_bot: return
+    if not flag("grp_detect", "1"): return
+    urls = [u for u in urls_from_message(m) if detect(u) != "other"]
+    if not urls: return
+    user = m.from_user
+    if is_banned(user.id): return
+    register_user(user)
+    if await missing_channels(context.bot, user.id): return        # لا نزعج المجموعة ببوابة الاشتراك
+    await process_link(context, user, m.chat_id, m.message_id, urls[0])
+
+
+async def daily_report_loop(app):
+    while True:
+        now = datetime.now(timezone.utc)
+        nxt = now.replace(hour=20, minute=55, second=0, microsecond=0)   # قبل منتصف الليل بتوقيت العراق
+        if nxt <= now: nxt += timedelta(days=1)
+        await asyncio.sleep((nxt - now).total_seconds())
+        try:
+            if flag("daily_report", "1"):
+                await notify_admins(app.bot, "🗓 <b>التقرير اليومي</b>\n\n" + stats_text(), parse_mode=HTML)
+        except Exception:
+            log.exception("daily report failed")
+
+
+# ---------------- التشغيل ----------------
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled error", exc_info=context.error)
+
+
+async def post_init(app):
+    await app.bot.set_my_commands([BotCommand("start", "القائمة الرئيسية / Menu"),
+                                   BotCommand("help", "طريقة الاستخدام / How to use"),
+                                   BotCommand("cancel", "إلغاء / Cancel")])
+    for aid in admin_ids():
+        await refresh_private_commands(app.bot, aid)
+    await app.bot.set_my_commands([BotCommand("d", "تحميل فيديو من رابط"), BotCommand("a", "تحميل الصوت فقط"),
+                                   BotCommand("v", "تحميل فيديو يوتيوب")], scope=BotCommandScopeAllGroupChats())
+    log.info("ffmpeg: %s | cookies: %s", HAS_FFMPEG, os.path.exists(COOKIES))
+    app.create_task(daily_report_loop(app))
+
+
+def main():
+    app = Application.builder().token(TOKEN).post_init(post_init).concurrent_updates(True).build()
+    app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("help", help_cmd, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("admin", admin_cmd, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("owner", owner_cmd, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("cancel", cancel, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("stats", stats_cmd, filters=filters.ChatType.PRIVATE))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CommandHandler(["d", "v", "a"], cmd_dl))
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+                                   on_group_message))
+    app.add_error_handler(on_error)
+    log.info("🚀 البوت يعمل الآن...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
